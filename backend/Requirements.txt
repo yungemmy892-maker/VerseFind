@@ -1,0 +1,13 @@
+django>=4.2,<5.0
+djangorestframework>=3.14
+django-cors-headers>=4.3
+psycopg2-binary>=2.9
+python-dotenv>=1.0
+rapidfuzz>=3.0
+
+# Optional: for Whisper API transcription
+openai>=1.0
+
+# Optional: for local Whisper (heavier, no API key needed)
+# openai-whisper>=20231117
+# torch>=2.0  # required by whisper
