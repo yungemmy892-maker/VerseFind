@@ -11,18 +11,14 @@ DELETE /api/saved/<id>/  — remove saved verse
 GET  /api/versions/      — list available Bible versions
 """
 
-import json
-import tempfile
 import os
+import tempfile
 
-from django.http import JsonResponse
-from django.views.decorators.csrf import csrf_exempt
-from django.views.decorators.http import require_http_methods
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from rest_framework import status
 
-from bible.matching import find_verse, get_context_verses, normalize
+from bible.matching import find_verse, get_context_verses
 from bible.models import Verse, BibleVersion, SavedVerse, Book
 
 
@@ -32,22 +28,16 @@ from bible.models import Verse, BibleVersion, SavedVerse, Book
 
 @api_view(["POST"])
 def identify_verse(request):
-    """
-    Body: { "text": "for god so loved the world", "version": "KJV" }
-    Returns best match(es) with confidence scores.
-    """
     data = request.data
     text = data.get("text", "").strip()
     version = data.get("version", "KJV").upper()
 
     if not text:
         return Response({"error": "text is required"}, status=status.HTTP_400_BAD_REQUEST)
-
     if len(text) < 4:
         return Response({"error": "Query too short — please enter more of the verse"}, status=400)
 
     result = find_verse(text, version_code=version)
-
     return Response(result, status=status.HTTP_200_OK)
 
 
@@ -58,13 +48,9 @@ def identify_verse(request):
 @api_view(["POST"])
 def transcribe_audio(request):
     """
-    Multipart: audio file in request.FILES["audio"]
-    Returns: { "text": "transcribed verse text" }
-
-    Supports:
-      - OpenAI Whisper API (set OPENAI_API_KEY in .env)
-      - Local whisper (pip install openai-whisper, set USE_LOCAL_WHISPER=True)
-      - Fallback: returns placeholder for development
+    Windows fix: NamedTemporaryFile holds an exclusive lock while open.
+    Passing its path to Whisper/OpenAI raises WinError 2.
+    Fix: write to a plain path, CLOSE the file, then pass the path.
     """
     from django.conf import settings
 
@@ -72,59 +58,64 @@ def transcribe_audio(request):
     if not audio_file:
         return Response({"error": "audio file required"}, status=400)
 
-    # Validate file type
+    # Accept any webm/mp4/wav/ogg/m4a — strip codec suffix for comparison
+    content_type = (audio_file.content_type or "").split(";")[0].strip()
     allowed_types = ["audio/webm", "audio/mp4", "audio/mpeg", "audio/wav", "audio/ogg", "audio/m4a"]
-    if audio_file.content_type not in allowed_types:
-        return Response({"error": f"Unsupported audio format: {audio_file.content_type}"}, status=400)
+    if content_type not in allowed_types:
+        return Response({"error": f"Unsupported audio format: {content_type}"}, status=400)
+
+    # Write to a named path and CLOSE before Whisper reads it (Windows-safe)
+    tmp_path = os.path.join(tempfile.gettempdir(), f"versefind_{os.getpid()}.webm")
 
     try:
-        # Option A: OpenAI Whisper API
+        with open(tmp_path, "wb") as f:
+            for chunk in audio_file.chunks():
+                f.write(chunk)
+        # File fully written and closed — safe to re-open on Windows
+
         if settings.OPENAI_API_KEY and not settings.USE_LOCAL_WHISPER:
             import openai
             client = openai.OpenAI(api_key=settings.OPENAI_API_KEY)
+            with open(tmp_path, "rb") as f:
+                transcript = client.audio.transcriptions.create(
+                    model="whisper-1", file=f, language="en",
+                )
+            return Response({"text": transcript.text, "source": "whisper-api"})
 
-            with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp:
-                for chunk in audio_file.chunks():
-                    tmp.write(chunk)
-                tmp_path = tmp.name
-
-            try:
-                with open(tmp_path, "rb") as f:
-                    transcript = client.audio.transcriptions.create(
-                        model="whisper-1",
-                        file=f,
-                        language="en",
-                    )
-                return Response({"text": transcript.text, "source": "whisper-api"})
-            finally:
-                os.unlink(tmp_path)
-
-        # Option B: Local whisper
         elif settings.USE_LOCAL_WHISPER:
+            # Check ffmpeg is available — on Windows [WinError 2] = ffmpeg not on PATH
+            import shutil
+            if not shutil.which("ffmpeg"):
+                return Response({
+                    "error": (
+                        "ffmpeg is not installed or not on your PATH. "
+                        "Whisper needs ffmpeg to decode audio. "
+                        "Download from https://ffmpeg.org/download.html, "
+                        "extract it, and add the bin/ folder to your Windows PATH. "
+                        "Then restart your terminal and Django server."
+                    )
+                }, status=500)
             import whisper
+            model = whisper.load_model("base")
+            result = model.transcribe(tmp_path, language="en")
+            return Response({"text": result["text"].strip(), "source": "whisper-local"})
 
-            with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp:
-                for chunk in audio_file.chunks():
-                    tmp.write(chunk)
-                tmp_path = tmp.name
-
-            try:
-                model = whisper.load_model("base")
-                result = model.transcribe(tmp_path, language="en")
-                return Response({"text": result["text"].strip(), "source": "whisper-local"})
-            finally:
-                os.unlink(tmp_path)
-
-        # Dev fallback
         else:
             return Response({
                 "text": "",
                 "source": "none",
-                "warning": "No transcription service configured. Set OPENAI_API_KEY in .env or USE_LOCAL_WHISPER=True"
+                "warning": "No transcription service configured. Set OPENAI_API_KEY in .env or USE_LOCAL_WHISPER=True",
             })
 
     except Exception as e:
         return Response({"error": f"Transcription failed: {str(e)}"}, status=500)
+
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
 # --------------------------------------------------------------------------- #
@@ -133,15 +124,11 @@ def transcribe_audio(request):
 
 @api_view(["GET"])
 def get_verse(request):
-    """
-    ?book=John&chapter=3&verse=16&version=KJV&context=3
-    Returns verse + surrounding context verses.
-    """
     book_name = request.query_params.get("book", "")
-    chapter = request.query_params.get("chapter", 0)
+    chapter   = request.query_params.get("chapter", 0)
     verse_num = request.query_params.get("verse", 0)
-    version = request.query_params.get("version", "KJV")
-    window = int(request.query_params.get("context", 3))
+    version   = request.query_params.get("version", "KJV")
+    window    = int(request.query_params.get("context", 3))
 
     try:
         verse = Verse.objects.select_related("book", "version").get(
@@ -154,7 +141,6 @@ def get_verse(request):
         return Response({"error": "Verse not found"}, status=404)
 
     context = get_context_verses(book_name, int(chapter), int(verse_num), version, window)
-
     return Response({
         "verse": _serialize_verse(verse),
         "context": [_serialize_verse(v) for v in context],
@@ -163,13 +149,9 @@ def get_verse(request):
 
 @api_view(["GET"])
 def get_chapter(request):
-    """
-    ?book=John&chapter=3&version=KJV
-    Returns all verses in a chapter.
-    """
     book_name = request.query_params.get("book", "")
-    chapter = request.query_params.get("chapter", 1)
-    version = request.query_params.get("version", "KJV")
+    chapter   = request.query_params.get("chapter", 1)
+    version   = request.query_params.get("version", "KJV")
 
     verses = Verse.objects.filter(
         book__name=book_name,
@@ -212,32 +194,25 @@ def saved_verses(request):
             for s in saved
         ])
 
-    elif request.method == "POST":
-        verse_id = request.data.get("verse_id")
-        note = request.data.get("note", "")
+    verse_id = request.data.get("verse_id")
+    note     = request.data.get("note", "")
+    try:
+        verse = Verse.objects.get(id=verse_id)
+    except Verse.DoesNotExist:
+        return Response({"error": "Verse not found"}, status=404)
 
-        try:
-            verse = Verse.objects.get(id=verse_id)
-        except Verse.DoesNotExist:
-            return Response({"error": "Verse not found"}, status=404)
-
-        saved, created = SavedVerse.objects.get_or_create(
-            session_key=session_key,
-            verse=verse,
-            defaults={"note": note},
-        )
-        return Response({
-            "id": saved.id,
-            "created": created,
-            "verse": _serialize_verse(verse),
-        }, status=201 if created else 200)
+    saved, created = SavedVerse.objects.get_or_create(
+        session_key=session_key, verse=verse, defaults={"note": note}
+    )
+    return Response({
+        "id": saved.id, "created": created, "verse": _serialize_verse(verse),
+    }, status=201 if created else 200)
 
 
 @api_view(["DELETE"])
 def delete_saved(request, pk):
     if not request.session.session_key:
         return Response({"error": "No session"}, status=400)
-
     try:
         saved = SavedVerse.objects.get(id=pk, session_key=request.session.session_key)
         saved.delete()

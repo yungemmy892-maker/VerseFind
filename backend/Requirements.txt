@@ -4,6 +4,9 @@ django-cors-headers>=4.3
 psycopg2-binary>=2.9
 python-dotenv>=1.0
 rapidfuzz>=3.0
+gunicorn>=21.2
+dj-database-url>=2.1
+whitenoise>=6.6
 
 # Optional: for Whisper API transcription
 openai>=1.0
