@@ -1,28 +1,68 @@
- 
-import { useState } from "react";
+import { useState, useRef, useCallback } from "react";
 import { useVoiceRecorder } from "../hooks/useVoiceRecorder";
 import { api } from "../services/api";
- 
+
+// ── Web Speech API (browser built-in, no API key needed) ────────────────── //
+function useBrowserSpeech() {
+  const recognitionRef = useRef(null);
+
+  const listen = useCallback(() => {
+    return new Promise((resolve, reject) => {
+      const SpeechRecognition =
+        window.SpeechRecognition || window.webkitSpeechRecognition;
+
+      if (!SpeechRecognition) {
+        reject(new Error("Browser speech not supported. Use text mode."));
+        return;
+      }
+
+      const recognition = new SpeechRecognition();
+      recognitionRef.current = recognition;
+      recognition.lang = "en-US";
+      recognition.interimResults = false;
+      recognition.maxAlternatives = 1;
+
+      recognition.onresult = (e) => {
+        const text = e.results[0][0].transcript;
+        resolve(text);
+      };
+      recognition.onerror = (e) => {
+        reject(new Error(e.error === "not-allowed"
+          ? "Microphone access denied. Allow mic in browser settings."
+          : `Speech error: ${e.error}`));
+      };
+      recognition.onend = () => {};
+      recognition.start();
+    });
+  }, []);
+
+  return { listen };
+}
+
 export default function IdentifyScreen({ version, onVersionChange, onResult }) {
   const [textInput, setTextInput] = useState("");
   const [mode, setMode] = useState("voice"); // voice | text
   const [loading, setLoading] = useState(false);
+  const [listening, setListening] = useState(false);
   const [error, setError] = useState(null);
   const [transcript, setTranscript] = useState("");
   const recorder = useVoiceRecorder();
- 
+  const browser = useBrowserSpeech();
+
   const handleMicPress = async () => {
     setError(null);
+
+    // ── If already recording (Whisper mode), stop it ── //
     if (recorder.isRecording) {
       try {
         const blob = await recorder.stop();
         setLoading(true);
         setTranscript("");
- 
         const { text, warning } = await api.transcribe(blob);
         if (warning) {
-          setError(warning);
+          // Whisper not configured — fall back to browser speech silently
           setLoading(false);
+          await handleBrowserSpeech();
           return;
         }
         if (!text) {
@@ -30,29 +70,61 @@ export default function IdentifyScreen({ version, onVersionChange, onResult }) {
           setLoading(false);
           return;
         }
- 
-        setTranscript(text);
- 
-        const result = await api.identify(text, version);
-        setLoading(false);
-        if (result.found) {
-          onResult(result);
-        } else {
-          setError(`No match found for: "${text}". Try speaking more of the verse.`);
-        }
+        await identifyText(text);
       } catch (err) {
         setLoading(false);
         setError(err.message);
       }
-    } else {
-      recorder.start();
+      return;
+    }
+
+    // ── Try browser speech first (no API key needed) ── //
+    await handleBrowserSpeech();
+  };
+
+  const handleBrowserSpeech = async () => {
+    setListening(true);
+    setError(null);
+    try {
+      const text = await browser.listen();
+      setListening(false);
+      if (!text) {
+        setError("Could not hear anything. Please try again.");
+        return;
+      }
+      setTranscript(text);
+      await identifyText(text);
+    } catch (err) {
+      setListening(false);
+      // Browser speech failed — fall back to Whisper recorder
+      if (err.message.includes("not supported")) {
+        recorder.start();
+      } else {
+        setError(err.message);
+      }
     }
   };
- 
+
+  const identifyText = async (text) => {
+    setLoading(true);
+    try {
+      const result = await api.identify(text, version);
+      setLoading(false);
+      if (result.found) {
+        onResult(result);
+      } else {
+        setError(`No match found for "${text}". Try speaking more of the verse.`);
+      }
+    } catch (err) {
+      setLoading(false);
+      setError(err.message);
+    }
+  };
+
   const handleTextSearch = async (e) => {
     e.preventDefault();
     if (!textInput.trim()) return;
- 
+
     setError(null);
     setLoading(true);
     try {
@@ -68,16 +140,17 @@ export default function IdentifyScreen({ version, onVersionChange, onResult }) {
       setError(err.message);
     }
   };
- 
-  const micState = recorder.isRecording ? "recording" : loading ? "loading" : "idle";
- 
+
+  const micState = (recorder.isRecording || listening) ? "recording" : loading ? "loading" : "idle";
+
   return (
     <div className="identify-screen">
       <div className="app-header">
         <h1 className="app-title">VerseFind</h1>
         <p className="app-subtitle">Speak or type a Bible verse to identify it</p>
       </div>
- 
+
+      {/* Version selector */}
       <div className="version-select-wrap">
         <select
           className="version-select"
@@ -90,7 +163,8 @@ export default function IdentifyScreen({ version, onVersionChange, onResult }) {
           <option value="NKJV">NKJV</option>
         </select>
       </div>
- 
+
+      {/* Mode tabs */}
       <div className="mode-tabs">
         <button
           className={`mode-tab ${mode === "voice" ? "active" : ""}`}
@@ -105,7 +179,7 @@ export default function IdentifyScreen({ version, onVersionChange, onResult }) {
           Text
         </button>
       </div>
- 
+
       {mode === "voice" && (
         <div className="voice-area">
           <div className="mic-wrap">
@@ -119,6 +193,7 @@ export default function IdentifyScreen({ version, onVersionChange, onResult }) {
               className={`mic-btn ${micState}`}
               onClick={handleMicPress}
               disabled={loading || recorder.state === "requesting" || recorder.state === "processing"}
+              style={listening ? {background: "var(--accent)", color: "white"} : {}}
               aria-label={recorder.isRecording ? "Stop recording" : "Start recording"}
             >
               {loading ? (
@@ -135,25 +210,25 @@ export default function IdentifyScreen({ version, onVersionChange, onResult }) {
               )}
             </button>
           </div>
- 
+
           <p className="mic-label">
             {recorder.state === "requesting" && "Requesting microphone…"}
-            {recorder.isRecording && "Listening — tap to stop"}
+            {(recorder.isRecording || listening) && "Listening — speak now…"}
             {recorder.state === "processing" && "Processing audio…"}
             {loading && transcript && `Matching: "${transcript}"`}
             {loading && !transcript && "Identifying verse…"}
-            {!recorder.isRecording && !loading && recorder.state === "idle" && "Tap to identify verse"}
+            {!recorder.isRecording && !listening && !loading && recorder.state === "idle" && "Tap to identify verse"}
           </p>
- 
+
           {recorder.error && <p className="error-msg">{recorder.error}</p>}
         </div>
       )}
- 
+
       {mode === "text" && (
         <form className="text-area" onSubmit={handleTextSearch}>
           <textarea
             className="verse-input"
-            placeholder={`Type part of a verse… e.g. "For God so loved the world"`}
+            placeholder="Type part of a verse… e.g. For God so loved the world"
             value={textInput}
             onChange={(e) => setTextInput(e.target.value)}
             rows={4}
@@ -168,20 +243,18 @@ export default function IdentifyScreen({ version, onVersionChange, onResult }) {
           </button>
         </form>
       )}
- 
+
       {error && (
         <div className="error-card">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-            <circle cx="12" cy="12" r="10"/>
-            <line x1="12" y1="8" x2="12" y2="12"/>
-            <line x1="12" y1="16" x2="12.01" y2="16"/>
+            <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
           </svg>
           {error}
         </div>
       )}
- 
+
       <div className="tips">
-        <p className="tip">💡 You can quote just a few words — e.g. "the Lord is my shepherd"</p>
+        <p className="tip"> You can quote just a few words — e.g. "the Lord is my shepherd"</p>
       </div>
     </div>
   );
