@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Render runs this automatically on every deploy.
 set -o errexit
 
 echo "=== Installing dependencies ==="
@@ -10,14 +11,14 @@ python manage.py collectstatic --no-input
 echo "=== Running migrations ==="
 python manage.py migrate
 
-echo "=== Loading Bible data (safe) ==="
-python manage.py load_kjv
+echo "=== Cleaning verses ==="
+python scripts/clean_verses.py
 
-echo "=== Cleaning verses (safe) ==="
-python manage.py clean_verses
+echo "=== Loading KJV data ==="
+python scripts/load_kjv.py
 
 echo "=== Verifying database ==="
-python manage.py check_db || echo "DB check skipped"
+python scripts/check_db.py
 
 echo "=== Building phonetic index ==="
 python manage.py build_phonetic_index
