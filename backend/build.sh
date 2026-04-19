@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
 set -o errexit
 
-echo "=== Moving into backend ==="
-cd backend
-
 echo "=== Installing dependencies ==="
 pip install -r requirements.txt
 
