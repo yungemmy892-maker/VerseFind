@@ -196,8 +196,29 @@ def saved_verses(request):
 
     verse_id = request.data.get("verse_id")
     note     = request.data.get("note", "")
+
+    # Try lookup by id first (fast path)
+    # Fall back to book/chapter/verse_number/version if id missing
     try:
-        verse = Verse.objects.get(id=verse_id)
+        if verse_id:
+            verse = Verse.objects.get(id=verse_id)
+        else:
+            # identify endpoint returns these fields — use them as fallback
+            book_name    = request.data.get("book", "")
+            chapter      = request.data.get("chapter")
+            verse_number = request.data.get("verse_number")
+            version_code = request.data.get("version", "KJV")
+            if not all([book_name, chapter, verse_number]):
+                return Response(
+                    {"error": "Provide verse_id or book + chapter + verse_number"},
+                    status=400,
+                )
+            verse = Verse.objects.get(
+                book__name=book_name,
+                chapter=int(chapter),
+                verse_number=int(verse_number),
+                version__code=version_code,
+            )
     except Verse.DoesNotExist:
         return Response({"error": "Verse not found"}, status=404)
 
